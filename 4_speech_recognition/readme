@@ -1,0 +1,16 @@
+序列模型基础：
+你理解 RNN / LSTM 的输入输出结构，也写过 transformer encoder
+
+能理解时间序列长度 T 和目标序列长度 U 的不同
+
+有一定的 PyTorch 编程能力，能看懂并改写模型代码
+
+深度学习实践经验：
+你已经实现过 transformer + CTC 架构相关的训练（比如做过语音/文本 demo）
+
+能理解 log_softmax, nn.CTCLoss 的代码使用方式
+
+工程层面：
+你非常熟悉模型 forward 的维度处理和张量变换，能看懂 [batch, time, class] → [time, batch, class] 的必要性
+
+知道如何手动传入 input_length / target_length 控制变长序列
