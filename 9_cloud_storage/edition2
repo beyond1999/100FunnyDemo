@@ -1,0 +1,779 @@
+# Titan ObjStore – 分布式对象存储（重量级雏形）
+
+> 目标：给你一个可扩展到“工业级”的 Go 分布式对象存储骨架：S3/Gateway、元数据（etcd/raft）、对象节点（本地盘 + WAL + 纠删码）、一致性哈希、指标/追踪、签名 URL、生命周期钩子。可以本地跑 PoC，再逐步补齐。
+
+---
+
+## 目录结构（Monorepo）
+```
+.
+├── go.mod
+├── README.md
+├── build/
+│   └── docker-compose.yaml          # etcd(3) + gateway + metaserver + objnode(3)
+├── cmd/
+│   ├── gateway/main.go              # S3 兼容网关（最小可用 PUT/GET/DELETE）
+│   ├── metaserver/main.go           # 元数据服务（etcd/raft 驱动）
+│   └── objnode/main.go              # 对象节点服务（gRPC，盘上存块）
+├── pkg/
+│   ├── api/
+│   │   ├── proto/objectstore.proto  # gRPC 定义
+│   │   └── gen/                     # 生成代码（按你本地 protoc 生成）
+│   ├── common/
+│   │   ├── config.go
+│   │   ├── logging.go
+│   │   └── tracing.go
+│   ├── gateway/
+│   │   ├── server.go
+│   │   ├── s3handlers.go
+│   │   └── multiparter.go
+│   ├── hashring/hashring.go
+│   ├── lifecycle/manager.go
+│   ├── meta/
+│   │   ├── client.go                # etcd v3 基于事务的元数据接口
+│   │   └── model.go                 # Object/Part/Chunk schema
+│   ├── objnode/
+│   │   ├── server.go                # gRPC 对外服务
+│   │   ├── storage.go               # 盘上布局 + 校验
+│   │   ├── wal.go                   # 轻量 WAL（fsync 保障顺序一致性）
+│   │   └── erasure.go               # 纠删码(k,m) using klauspost/reedsolomon
+│   ├── signer/signer.go             # HMAC 签名URL
+│   └── util/
+│       ├── bytespool.go             # sync.Pool 大块缓存
+│       └── checksum.go              # xxhash/sha256/etag
+└── tools/                           # 脚本、protoc 生成器（可选）
+```
+
+---
+
+## go.mod（核心依赖）
+```go
+module titan/objstore
+
+go 1.22
+
+require (
+	github.com/aws/aws-sdk-go-v2 v1.32.0 // 用于 S3 兼容签名解析（可选）
+	github.com/go-chi/chi/v5 v5.1.0
+	github.com/klauspost/reedsolomon v1.12.5
+	github.com/prometheus/client_golang v1.20.5
+	github.com/rs/zerolog v1.33.0
+	go.etcd.io/etcd/client/v3 v3.5.15
+	google.golang.org/grpc v1.65.0
+	google.golang.org/protobuf v1.34.2
+	github.com/cespare/xxhash/v2 v2.3.0
+)
+```
+
+---
+
+## build/docker-compose.yaml（本地 PoC）
+```yaml
+version: '3.8'
+services:
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.15
+    command: >-
+      /usr/local/bin/etcd \
+      --name etcd1 \
+      --initial-advertise-peer-urls http://etcd1:2380 \
+      --listen-peer-urls http://0.0.0.0:2380 \
+      --listen-client-urls http://0.0.0.0:2379 \
+      --advertise-client-urls http://etcd1:2379 \
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380 \
+      --initial-cluster-state new
+    ports: ["2379:2379"]
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.15
+    command: >-
+      /usr/local/bin/etcd \
+      --name etcd2 \
+      --initial-advertise-peer-urls http://etcd2:2380 \
+      --listen-peer-urls http://0.0.0.0:2380 \
+      --listen-client-urls http://0.0.0.0:2379 \
+      --advertise-client-urls http://etcd2:2379 \
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380 \
+      --initial-cluster-state new
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.15
+    command: >-
+      /usr/local/bin/etcd \
+      --name etcd3 \
+      --initial-advertise-peer-urls http://etcd3:2380 \
+      --listen-peer-urls http://0.0.0.0:2380 \
+      --listen-client-urls http://0.0.0.0:2379 \
+      --advertise-client-urls http://etcd3:2379 \
+      --initial-cluster etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380 \
+      --initial-cluster-state new
+
+  metaserver:
+    build: ..
+    command: ["/app/metaserver"]
+    environment:
+      - ETCD_ENDPOINTS=http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
+    depends_on: [etcd1, etcd2, etcd3]
+
+  obj1:
+    build: ..
+    command: ["/app/objnode", "--id=obj1", "--addr=:7001", "--data=/data"]
+    volumes: ["obj1:/data"]
+  obj2:
+    build: ..
+    command: ["/app/objnode", "--id=obj2", "--addr=:7002", "--data=/data"]
+    volumes: ["obj2:/data"]
+  obj3:
+    build: ..
+    command: ["/app/objnode", "--id=obj3", "--addr=:7003", "--data=/data"]
+    volumes: ["obj3:/data"]
+
+  gateway:
+    build: ..
+    command: ["/app/gateway", "--addr=:8080", "--metaserver=metaserver:9090"]
+    ports: ["8080:8080"]
+    depends_on: [metaserver, obj1, obj2, obj3]
+
+volumes:
+  obj1: {}
+  obj2: {}
+  obj3: {}
+```
+
+---
+
+## pkg/api/proto/objectstore.proto（gRPC 定义）
+```proto
+syntax = "proto3";
+package titan.objstore.v1;
+option go_package = "titan/objstore/pkg/api/gen;gen";
+
+message Node {
+  string id = 1;
+  string address = 2; // host:port for ObjNodeService
+}
+
+message ChunkRef {
+  bytes  id = 1;  // content-addressed SHA256
+  uint32 index = 2; // 第几个分片
+  uint32 stripe = 3; // 第几个纠删条带
+}
+
+message Placement {
+  repeated Node data_nodes = 1;
+  repeated Node parity_nodes = 2;
+}
+
+message PutObjectRequest {
+  string bucket = 1;
+  string key = 2;
+  uint64 size = 3;
+  string content_type = 4;
+  string if_none_match = 5; // 简化：支持 If-None-Match: "*"
+}
+message PutObjectResponse {
+  string version = 1;
+}
+
+message CommitObjectRequest {
+  string bucket = 1;
+  string key = 2;
+  string upload_id = 3;
+  repeated ChunkRef chunks = 4;
+}
+message CommitObjectResponse { string version = 1; }
+
+message AllocatePlacementRequest {
+  uint32 k = 1; // data shards
+  uint32 m = 2; // parity shards
+}
+message AllocatePlacementResponse { Placement placement = 1; }
+
+service MetaService {
+  rpc AllocatePlacement(AllocatePlacementRequest) returns (AllocatePlacementResponse);
+  rpc PutObject(PutObjectRequest) returns (PutObjectResponse);
+  rpc CommitObject(CommitObjectRequest) returns (CommitObjectResponse);
+}
+
+message PutChunkRequest {
+  bytes chunk_id = 1;
+  uint32 index = 2;
+  bytes data = 3;
+  bytes checksum = 4; // sha256 of data
+}
+message PutChunkResponse {}
+
+message GetChunkRequest { bytes chunk_id = 1; uint32 index = 2; }
+message GetChunkResponse { bytes data = 1; }
+
+service ObjNodeService {
+  rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
+  rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
+}
+```
+
+> 说明：真实系统会用 gRPC streaming 传大块；这里雏形先用 unary 简化（易跑通）。
+
+---
+
+## pkg/hashring/hashring.go（一致性哈希，虚拟节点）
+```go
+package hashring
+
+import (
+	"sort"
+	"strconv"
+
+	xx "github.com/cespare/xxhash/v2"
+)
+
+type Node struct{ ID, Addr string }
+
+type vnode struct{ hash uint64; node Node }
+
+type Ring struct {
+	vnodes []vnode
+	replicas int
+}
+
+func New(nodes []Node, replicas int) *Ring {
+	r := &Ring{replicas: replicas}
+	for _, n := range nodes {
+		for i := 0; i < replicas; i++ {
+			h := xx.Sum64String(n.ID + ":" + strconv.Itoa(i))
+			r.vnodes = append(r.vnodes, vnode{hash: h, node: n})
+		}
+	}
+	sort.Slice(r.vnodes, func(i, j int) bool { return r.vnodes[i].hash < r.vnodes[j].hash })
+	return r
+}
+
+// N 个不同节点（去重）
+func (r *Ring) PickN(key string, n int) []Node {
+	if len(r.vnodes) == 0 || n <= 0 { return nil }
+	h := xx.Sum64String(key)
+	i := sort.Search(len(r.vnodes), func(i int) bool { return r.vnodes[i].hash >= h })
+	res := make([]Node, 0, n)
+	seen := map[string]struct{}{}
+	for j := 0; len(res) < n && j < len(r.vnodes); j++ {
+		vn := r.vnodes[(i+j)%len(r.vnodes)]
+		if _, ok := seen[vn.node.ID]; ok { continue }
+		seen[vn.node.ID] = struct{}{}
+		res = append(res, vn.node)
+	}
+	return res
+}
+```
+
+---
+
+## pkg/meta/model.go（对象元数据 Schema）
+```go
+package meta
+
+type Object struct {
+	Bucket      string `json:"bucket"`
+	Key         string `json:"key"`
+	Version     string `json:"version"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"content_type"`
+	Chunks      []ChunkRef `json:"chunks"`
+}
+
+type ChunkRef struct {
+	ChunkID []byte `json:"chunk_id"`
+	Index   uint32 `json:"index"`
+	Stripe  uint32 `json:"stripe"`
+	// 省略：节点位置信息（或由 placement 表推得）
+}
+```
+
+---
+
+## pkg/meta/client.go（etcd 事务 & 放置计算）
+```go
+package meta
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
+)
+
+type Client struct { cli *clientv3.Client }
+
+func New(endpoints []string) (*Client, error) {
+	cli, err := clientv3.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 3 * time.Second})
+	if err != nil { return nil, err }
+	return &Client{cli: cli}, nil
+}
+
+func (c *Client) keyObj(bucket, key string) string {
+	return fmt.Sprintf("/titan/obj/%s/%s", bucket, key)
+}
+
+// CAS 创建对象元数据骨架（If-None-Match:*）
+func (c *Client) PutObject(ctx context.Context, bucket, key, contentType string, size int64) (version string, err error) {
+	k := c.keyObj(bucket, key)
+	version = fmt.Sprintf("v-%d", time.Now().UnixNano())
+	obj := Object{Bucket: bucket, Key: key, Version: version, Size: size, ContentType: contentType}
+	b, _ := json.Marshal(obj)
+	// 仅当不存在时写入
+	txn := c.cli.Txn(ctx).If(clientv3.Compare(clientv3.Version(k), "=", 0)).Then(clientv3.OpPut(k, string(b)))
+	resp, err := txn.Commit()
+	if err != nil { return "", err }
+	if !resp.Succeeded { return "", fmt.Errorf("precondition failed") }
+	return version, nil
+}
+
+// 完成写入：更新 chunks + version hash（乐观并发）
+func (c *Client) CommitObject(ctx context.Context, bucket, key string, chunks []ChunkRef) (string, error) {
+	k := c.keyObj(bucket, key)
+	get, err := c.cli.Get(ctx, k)
+	if err != nil { return "", err }
+	if len(get.Kvs) == 0 { return "", fmt.Errorf("not found") }
+	var obj Object
+	if err := json.Unmarshal(get.Kvs[0].Value, &obj); err != nil { return "", err }
+	obj.Chunks = chunks
+	// 新版本号=sha256(chunks)
+	h := sha256.New()
+	for _, c := range chunks { h.Write(c.ChunkID) }
+	obj.Version = fmt.Sprintf("sha256:%x", h.Sum(nil)[:8])
+	b, _ := json.Marshal(obj)
+	txn := c.cli.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(k), "=", get.Kvs[0].ModRevision)).Then(clientv3.OpPut(k, string(b)))
+	resp, err := txn.Commit()
+	if err != nil { return "", err }
+	if !resp.Succeeded { return "", fmt.Errorf("conflict") }
+	return obj.Version, nil
+}
+
+// 这里应有：AllocatePlacement(k,m) 从 /titan/nodes/ 读取在线节点，做一致性哈希/反亲和，返回 data/parity nodes
+```
+
+---
+
+## pkg/objnode/wal.go（轻量 WAL）
+```go
+package objnode
+
+import (
+	"fmt"
+	"os"
+)
+
+type WAL struct { f *os.File }
+
+func OpenWAL(dir string) (*WAL, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil { return nil, err }
+	f, err := os.OpenFile(dir+"/wal.log", os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil { return nil, err }
+	return &WAL{f: f}, nil
+}
+
+func (w *WAL) Append(rec []byte) error {
+	if _, err := w.f.Write(rec); err != nil { return err }
+	if _, err := w.f.Write([]byte("\n")); err != nil { return err }
+	return w.f.Sync()
+}
+
+func (w *WAL) Close() error { return w.f.Close() }
+```
+
+---
+
+## pkg/objnode/storage.go（本地盘布局 + 校验）
+```go
+package objnode
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+)
+
+type Storage struct { base string; wal *WAL }
+
+func OpenStorage(base string) (*Storage, error) {
+	if err := os.MkdirAll(base, 0o755); err != nil { return nil, err }
+	wal, err := OpenWAL(filepath.Join(base, "wal"))
+	if err != nil { return nil, err }
+	return &Storage{base: base, wal: wal}, nil
+}
+
+func (s *Storage) chunkPath(id []byte, idx uint32) string {
+	h := hex.EncodeToString(id)
+	return filepath.Join(s.base, "chunks", h[:2], h[2:4], fmt.Sprintf("%s.%d", h, idx))
+}
+
+func (s *Storage) PutChunk(id []byte, idx uint32, data []byte) error {
+	p := s.chunkPath(id, idx)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil { return err }
+	// WAL: 记录将要写入的路径 + 校验
+	sum := sha256.Sum256(data)
+	rec := fmt.Sprintf("PUT %x %d %x", id, idx, sum)
+	if err := s.wal.Append([]byte(rec)); err != nil { return err }
+	if err := ioutil.WriteFile(p+".tmp", data, 0o644); err != nil { return err }
+	if err := os.Rename(p+".tmp", p); err != nil { return err }
+	return nil
+}
+
+func (s *Storage) GetChunk(id []byte, idx uint32) ([]byte, error) {
+	p := s.chunkPath(id, idx)
+	return os.ReadFile(p)
+}
+```
+
+---
+
+## pkg/objnode/erasure.go（纠删码 k+m）
+```go
+package objnode
+
+import (
+	"bytes"
+	"github.com/klauspost/reedsolomon"
+)
+
+type EC struct { enc reedsolomon.Encoder; k, m int }
+
+func NewEC(k, m int) (*EC, error) {
+	enc, err := reedsolomon.New(k, m)
+	if err != nil { return nil, err }
+	return &EC{enc: enc, k: k, m: m}, nil
+}
+
+// Split 将 data 切为 k+m 片段，每片长度相等（自动 padding）
+func (e *EC) Split(data []byte) ([][]byte, error) {
+	sz := (len(data) + e.k - 1) / e.k
+	shards := make([][]byte, e.k+e.m)
+	for i := 0; i < e.k; i++ { shards[i] = make([]byte, sz) }
+	copy(bytes.Join(shards[:e.k], nil), data) // 简化：演示思路
+	if err := e.enc.Encode(shards); err != nil { return nil, err }
+	return shards, nil
+}
+```
+
+> 正式实现需用 `Split()`/`Join()` 的标准分片方式；此处演示 API。
+
+---
+
+## pkg/objnode/server.go（对象节点 gRPC）
+```go
+package objnode
+
+import (
+	"context"
+	"net"
+
+	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc"
+	"titan/objstore/pkg/api/gen"
+)
+
+type Server struct {
+	gen.UnimplementedObjNodeServiceServer
+	st *Storage
+}
+
+func NewServer(st *Storage) *Server { return &Server{st: st} }
+
+func (s *Server) PutChunk(ctx context.Context, req *gen.PutChunkRequest) (*gen.PutChunkResponse, error) {
+	if err := s.st.PutChunk(req.ChunkId, req.Index, req.Data); err != nil {
+		return nil, err
+	}
+	return &gen.PutChunkResponse{}, nil
+}
+
+func (s *Server) GetChunk(ctx context.Context, req *gen.GetChunkRequest) (*gen.GetChunkResponse, error) {
+	b, err := s.st.GetChunk(req.ChunkId, req.Index)
+	if err != nil { return nil, err }
+	return &gen.GetChunkResponse{Data: b}, nil
+}
+
+func Serve(addr string, st *Storage) error {
+	lis, err := net.Listen("tcp", addr)
+	if err != nil { return err }
+	g := grpc.NewServer()
+	gen.RegisterObjNodeServiceServer(g, NewServer(st))
+	log.Info().Str("addr", addr).Msg("ObjNode listening")
+	return g.Serve(lis)
+}
+```
+
+---
+
+## cmd/objnode/main.go（对象节点可执行）
+```go
+package main
+
+import (
+	"flag"
+	"github.com/rs/zerolog/log"
+	"titan/objstore/pkg/objnode"
+)
+
+func main() {
+	id := flag.String("id", "obj1", "node id")
+	addr := flag.String("addr", ":7001", "listen addr")
+	data := flag.String("data", "./data", "data dir")
+	flag.Parse()
+
+	st, err := objnode.OpenStorage(*data)
+	if err != nil { log.Fatal().Err(err).Msg("open storage") }
+	if err := objnode.Serve(*addr, st); err != nil { log.Fatal().Err(err).Msg("serve") }
+	_ = id // 这里应把节点注册到 etcd /titan/nodes 下，省略
+}
+```
+
+---
+
+## pkg/gateway/server.go（HTTP 基础）
+```go
+package gateway
+
+import (
+	"net/http"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+type Server struct{ h http.Handler }
+
+func New() *Server {
+	r := chi.NewRouter()
+	r.Use(middleware.Recoverer)
+	r.Get("/livez", func(w http.ResponseWriter, _ *http.Request){ w.WriteHeader(200) })
+	return &Server{h: r}
+}
+
+func (s *Server) Handler() http.Handler { return s.h }
+```
+
+---
+
+## pkg/gateway/s3handlers.go（最小 PUT/GET 流程骨架）
+```go
+package gateway
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	gen "titan/objstore/pkg/api/gen"
+)
+
+type MetaClient interface {
+	AllocatePlacement(ctx context.Context, k, m int) (placement *gen.AllocatePlacementResponse, err error)
+	PutObject(ctx context.Context, bucket, key string, size int64, contentType string) (version string, err error)
+	CommitObject(ctx context.Context, bucket, key string, chunks []*gen.ChunkRef) (version string, err error)
+}
+
+type ObjClient interface {
+	PutChunk(ctx context.Context, addr string, chunkID []byte, idx uint32, data []byte) error
+}
+
+type Handler struct {
+	R *chi.Mux
+	Meta MetaClient
+	Obj  ObjClient
+	K, M int // EC 参数（例如 4+2）
+}
+
+func NewHandler(meta MetaClient, obj ObjClient, k, m int) *Handler {
+	h := &Handler{R: chi.NewRouter(), Meta: meta, Obj: obj, K: k, M: m}
+	h.R.Put("/v1/objects/{bucket}/*", h.putObject)
+	h.R.Get("/v1/objects/{bucket}/*", h.getObject) // 省略
+	return h
+}
+
+func (h *Handler) putObject(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucket := chi.URLParam(r, "bucket")
+	key := chi.URLParam(r, "*")
+	cl := r.Header.Get("Content-Length")
+	size, _ := strconv.ParseInt(cl, 10, 64)
+	contentType := r.Header.Get("Content-Type")
+
+	if _, err := h.Meta.PutObject(ctx, bucket, key, size, contentType); err != nil {
+		http.Error(w, err.Error(), http.StatusPreconditionFailed)
+		return
+	}
+	// 读取整个对象（演示；生产建议分片/流式 + gRPC streaming + 背压）
+	body, err := io.ReadAll(r.Body)
+	if err != nil { http.Error(w, err.Error(), 400); return }
+	sum := sha256.Sum256(body)
+	chunkID := sum[:] // 演示：整个对象一个 chunk
+
+	// 申请放置：返回 data/parity 节点
+	pl, err := h.Meta.AllocatePlacement(ctx, h.K, h.M)
+	if err != nil { http.Error(w, err.Error(), 500); return }
+
+	// 简化：把同一份数据发往所有 data 节点的 index=0，parity 暂略
+	for i, n := range pl.Placement.DataNodes {
+		if err := h.Obj.PutChunk(ctx, n.Address, chunkID, uint32(i), body); err != nil {
+			http.Error(w, "store failed:"+err.Error(), 500); return
+		}
+	}
+	// 提交元数据
+	ver, err := h.Meta.CommitObject(ctx, bucket, key, []*gen.ChunkRef{{ChunkId: chunkID, Index: 0, Stripe: 0}})
+	if err != nil { http.Error(w, err.Error(), 409); return }
+
+	w.Header().Set("ETag", "\"sha256-"+hex.EncodeToString(sum[:8])+"\"")
+	w.Header().Set("X-Version", ver)
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (h *Handler) getObject(w http.ResponseWriter, r *http.Request) {
+	// 查元数据 -> 找到 data_nodes -> 从一处/多处拉块 -> 纠删码重构 -> 回包（省略）
+	w.WriteHeader(501)
+}
+```
+
+---
+
+## cmd/gateway/main.go（启动网关）
+```go
+package main
+
+import (
+	"flag"
+	"net/http"
+	"github.com/rs/zerolog/log"
+	"titan/objstore/pkg/gateway"
+)
+
+// 这里把 MetaClient/ObjClient 的具体实现注入（略）。
+func main() {
+	addr := flag.String("addr", ":8080", "listen addr")
+	flag.Parse()
+
+	gw := gateway.New()
+	// TODO: gw.h = gateway.NewHandler(metaClient, objClient, 4, 2)
+
+	log.Info().Str("addr", *addr).Msg("Gateway listening")
+	_ = http.ListenAndServe(*addr, gw.Handler())
+}
+```
+
+---
+
+## cmd/metaserver/main.go（元数据服务骨架）
+```go
+package main
+
+import (
+	"flag"
+	"net"
+	"strings"
+
+	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc"
+	gen "titan/objstore/pkg/api/gen"
+	"titan/objstore/pkg/meta"
+)
+
+type svc struct{ gen.UnimplementedMetaServiceServer; m *meta.Client }
+
+func main() {
+	endpoints := flag.String("etcd", "http://127.0.0.1:2379", "comma sep etcd endpoints")
+	addr := flag.String("addr", ":9090", "listen addr")
+	flag.Parse()
+
+	m, err := meta.New(strings.Split(*endpoints, ","))
+	if err != nil { log.Fatal().Err(err).Msg("meta client") }
+
+	lis, _ := net.Listen("tcp", *addr)
+	g := grpc.NewServer()
+	gen.RegisterMetaServiceServer(g, &svc{m: m})
+	log.Info().Str("addr", *addr).Msg("MetaServer listening")
+	_ = g.Serve(lis)
+}
+```
+
+> 注意：`svc` 的各接口需要调用 `meta.Client` 的实现（AllocatePlacement/PutObject/CommitObject），此处略去样板代码。
+
+---
+
+## pkg/signer/signer.go（签名 URL）
+```go
+package signer
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
+	"net/url"
+	"time"
+)
+
+type Signer struct{ Secret []byte }
+
+func (s *Signer) Sign(method, path string, exp time.Time) string {
+	u := url.Values{}
+	u.Set("exp", fmt.Sprintf("%d", exp.Unix()))
+	mac := hmac.New(sha256.New, s.Secret)
+	mac.Write([]byte(method+"\n"+path+"\n"+u.Get("exp")))
+	u.Set("sig", base64.RawURLEncoding.EncodeToString(mac.Sum(nil)))
+	return u.Encode()
+}
+```
+
+---
+
+## pkg/common/config.go（公共配置）
+```go
+package common
+
+type GatewayConfig struct {
+	Addr string
+	MetaRPC string
+}
+
+type MetaConfig struct { Etcd []string; Addr string }
+
+type ObjNodeConfig struct { ID, Addr, DataDir string }
+```
+
+---
+
+## 运行指引（最小闭环）
+1) 先 `protoc` 生成 gRPC 代码到 `pkg/api/gen`；
+2) 分别编译 `cmd/objnode`, `cmd/metaserver`, `cmd/gateway`；
+3) `docker-compose up -d` 起 etcd；
+4) 起 3 个 objnode；
+5) 起 metaserver；
+6) 起 gateway；
+7) `curl -X PUT --data-binary @file.bin localhost:8080/v1/objects/bucket/foo.bin` 测试上传。
+
+> 当前雏形为了便于演示，把若干关键路径做了“单 chunk”与 unary RPC 简化；真正工业化落地需：
+> - gRPC **streaming** 传输分片 + 背压 + 超时/重试；
+> - MetaServer 的 `AllocatePlacement` 结合 **节点心跳/负载** 与 **反亲和**；
+> - 对象分片（chunk 16–64MiB）→ 条带划分 → **k+m 纠删码** → 多节点并发写；
+> - **端到端校验**（sha256/xxhash64 + E2E ETag）与 **读修复**；
+> - **GC/Lifecycle**（过期清理、版本化、分层存储）；
+> - **节点注册/发现**：objnode 在 etcd `/titan/nodes/<id>` 保持租约心跳；
+> - **观测性**：Prometheus 指标 + OpenTelemetry Trace；
+> - **鉴权/多租户**：JWT/OIDC 或 S3 SigV4；
+> - **一致性语义**：PUT 为写后读强一致（通过 etcd 事务 + 写成功 quorum）。
+
+---
+
+### 你可以立刻动手的 3 个“下一步”
+1. 在 `pkg/meta/client.go` 中实现 `AllocatePlacement(k,m)`：从 etcd 读取在线节点列表，使用 `hashring.PickN()` 选取 `k+m` 个目标节点。
+2. 在 `pkg/gateway/s3handlers.go` 把单对象改为 **分片上传**：循环从 `io.Reader` 读 16MiB，分别为每个 chunk 申请放置，然后并发调用 ObjNode 的 `PutChunk`；末尾提交 `CommitObject`。
+3. 在 `pkg/objnode/erasure.go` 中补全标准分片/重构逻辑，并在读取路径（GET）上实现解码与读修复。
+
+> 有了这个骨架，你可以逐步把它打磨到“工业级”。我会陪你把每个 TODO 补完。
